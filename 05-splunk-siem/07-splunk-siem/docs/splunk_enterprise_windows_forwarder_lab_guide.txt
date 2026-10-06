@@ -1,0 +1,987 @@
+Splunk Enterprise + Windows Universal Forwarder Lab
+===================================================
+
+Purpose
+-------
+This guide documents the full process used to deploy Splunk Enterprise on an Ubuntu Server VM, connect to it through SSH/MobaXterm, install Splunk Universal Forwarder on a Windows endpoint, and ingest Windows Event Logs into Splunk.
+
+The goal is to build and understand this pipeline:
+
+Windows Event Log
+        |
+        v
+Splunk Universal Forwarder
+        |
+        | TCP/9997
+        v
+Splunk Enterprise on Ubuntu Server
+        |
+        v
+Windows Index
+        |
+        v
+Search / SPL
+
+This guide is written so that someone with no knowledge of the original lab can reproduce the setup from the beginning.
+
+------------------------------------------------------------
+1. Lab Architecture
+------------------------------------------------------------
+
+Recommended layout:
+
+Physical Windows Host
+|
+|-- Ubuntu Server VM
+|     - Splunk Enterprise
+|     - Adapter 1: NAT
+|     - Adapter 2: Host-only
+|
+|-- Windows endpoint
+      - Can be the physical Windows host itself
+      - Splunk Universal Forwarder
+
+Why two network adapters on Ubuntu?
+
+NAT:
+- Used for Internet access and package downloads.
+- Common VirtualBox NAT address: 10.0.2.15.
+
+Host-only:
+- Used for communication between the physical host and the Ubuntu VM.
+- Example subnet: 192.168.56.0/24.
+- This is the IP that should normally be used for:
+  - SSH/MobaXterm
+  - Splunk Web
+  - Splunk Forwarder -> Splunk Enterprise communication
+
+Example:
+
+Ubuntu NAT IP:
+10.0.2.15
+
+Ubuntu Host-only IP:
+192.168.56.122
+
+Windows Host-only IP:
+192.168.56.120
+
+Important:
+Do not rely on the NAT IP for direct host-to-VM communication in a standard VirtualBox NAT configuration.
+
+------------------------------------------------------------
+2. Configure Ubuntu Networking
+------------------------------------------------------------
+
+2.1 Power off the Ubuntu VM.
+
+2.2 In VirtualBox:
+
+Settings
+-> Network
+
+Adapter 1:
+- Enable Network Adapter
+- Attached to: NAT
+
+Adapter 2:
+- Enable Network Adapter
+- Attached to: Host-only Adapter
+  or Host-only Network, depending on VirtualBox version
+
+2.3 Start Ubuntu.
+
+Check interfaces:
+
+ip a
+
+Typical result:
+
+enp0s3
+- NAT interface
+- Example: 10.0.2.15
+
+enp0s8
+- Host-only interface
+- Example: 192.168.56.122
+
+If enp0s8 is DOWN:
+
+sudo ip link set enp0s8 up
+
+Then check again:
+
+ip a
+
+------------------------------------------------------------
+3. Obtain an IP Address on the Host-only Interface
+------------------------------------------------------------
+
+If the interface is UP but has no IPv4 address, request one through DHCP.
+
+Install the DHCP client if needed:
+
+sudo apt update
+sudo apt install isc-dhcp-client -y
+
+Then request an address:
+
+sudo dhclient enp0s8
+
+Check:
+
+ip a
+
+or:
+
+hostname -I
+
+Expected example:
+
+10.0.2.15 192.168.56.122
+
+Troubleshooting:
+If "Unable to locate package" appears:
+
+1. Run:
+   sudo apt update
+
+2. Verify Internet connectivity through the NAT adapter.
+
+3. Confirm Ubuntu release information:
+   cat /etc/os-release
+
+------------------------------------------------------------
+4. Install and Enable SSH on Ubuntu
+------------------------------------------------------------
+
+Check whether SSH is running:
+
+sudo systemctl status ssh
+
+If SSH is not installed:
+
+sudo apt update
+sudo apt install openssh-server -y
+
+Enable and start SSH:
+
+sudo systemctl enable --now ssh
+
+Verify:
+
+sudo systemctl status ssh
+
+Expected:
+
+Active: active (running)
+
+Check TCP port 22:
+
+sudo ss -tulpn | grep :22
+
+Determine the Ubuntu username:
+
+whoami
+
+Determine the Host-only IP:
+
+hostname -I
+
+------------------------------------------------------------
+5. Connect to Ubuntu with MobaXterm
+------------------------------------------------------------
+
+From the physical Windows system:
+
+Test connectivity:
+
+ping <UBUNTU_HOST_ONLY_IP>
+
+Example:
+
+ping 192.168.56.122
+
+Optional SSH test:
+
+ssh <UBUNTU_USERNAME>@192.168.56.122
+
+In MobaXterm:
+
+Session
+-> SSH
+
+Remote host:
+192.168.56.122
+
+Port:
+22
+
+Username:
+Your Ubuntu username
+
+If SSH fails but the service is running:
+- Confirm that the Host-only adapter exists.
+- Confirm that the Host-only interface has an IP.
+- Confirm that Windows can ping the Ubuntu Host-only IP.
+- Check Ubuntu firewall:
+  sudo ufw status
+
+If UFW is active:
+
+sudo ufw allow OpenSSH
+
+------------------------------------------------------------
+6. Verify Ubuntu Resources Before Installing Splunk
+------------------------------------------------------------
+
+Check architecture:
+
+uname -m
+
+Expected on a typical x86 VM:
+
+x86_64
+
+Check disk space:
+
+df -h
+
+Splunk requires enough space for:
+- Installation files
+- Indexed data
+- Search artifacts
+- Internal logs
+
+A lab machine with tens of GB of free space is usually sufficient for a small training deployment.
+
+------------------------------------------------------------
+7. Download Splunk Enterprise
+------------------------------------------------------------
+
+Use the current Linux .deb package from the official Splunk download page.
+
+Change to a temporary directory:
+
+cd /tmp
+
+Download the package using the URL provided by Splunk:
+
+wget -O splunk.deb "<OFFICIAL_SPLUNK_DEB_DOWNLOAD_URL>"
+
+Verify:
+
+ls -lh splunk.deb
+
+Important:
+Use the current official download URL instead of copying an old version-specific URL from another guide.
+
+------------------------------------------------------------
+8. Install Splunk Enterprise
+------------------------------------------------------------
+
+Install the package:
+
+sudo dpkg -i splunk.deb
+
+Default installation path:
+
+/opt/splunk
+
+Verify:
+
+ls /opt/splunk
+
+Typical directories include:
+
+bin
+etc
+lib
+var
+
+------------------------------------------------------------
+9. Run Splunk with a Dedicated Service User
+------------------------------------------------------------
+
+Newer Splunk versions warn that running Splunk Enterprise as root is deprecated.
+
+Recommended lab setup:
+
+Create a dedicated Splunk user:
+
+sudo useradd -r -m -d /opt/splunk -s /bin/bash splunk
+
+Set ownership:
+
+sudo chown -R splunk:splunk /opt/splunk
+
+Start Splunk:
+
+sudo -u splunk /opt/splunk/bin/splunk start --accept-license
+
+During first startup, Splunk asks for:
+- Splunk administrator username
+- Splunk administrator password
+
+These credentials belong to Splunk Web/CLI.
+They are NOT the Ubuntu credentials.
+
+Do not commit credentials to GitHub.
+
+Expected startup message:
+
+The Splunk web interface is at http://ubuntu-server:8000
+
+Verify status:
+
+sudo -u splunk /opt/splunk/bin/splunk status
+
+Expected:
+
+splunkd is running
+
+------------------------------------------------------------
+10. Verify Splunk Web Port
+------------------------------------------------------------
+
+Check port 8000:
+
+sudo ss -tulpn | grep 8000
+
+From the physical Windows browser open:
+
+http://<UBUNTU_HOST_ONLY_IP>:8000
+
+Example:
+
+http://192.168.56.122:8000
+
+Log in using the Splunk administrator credentials created during first startup.
+
+Troubleshooting if Splunk Web does not open:
+
+1. Check Splunk status:
+   sudo -u splunk /opt/splunk/bin/splunk status
+
+2. Check port 8000:
+   sudo ss -tulpn | grep 8000
+
+3. Check the correct Host-only IP:
+   hostname -I
+
+4. Verify Windows can ping Ubuntu.
+
+5. Check UFW:
+   sudo ufw status
+
+If needed:
+
+sudo ufw allow 8000/tcp
+
+------------------------------------------------------------
+11. Configure Splunk to Receive Forwarded Data
+------------------------------------------------------------
+
+Important concept:
+
+"Configure receiving" is configured on Splunk Enterprise.
+
+"Configure forwarding" is configured on the machine that sends data.
+
+For this lab, Splunk Enterprise on Ubuntu is the receiver.
+
+In Splunk Web:
+
+Settings
+-> Forwarding and receiving
+-> Configure receiving
+-> New Receiving Port
+
+Enter only:
+
+9997
+
+Do NOT enter the Ubuntu IP in the receiving-port field.
+
+Reason:
+Splunk Enterprise is already running on that host. It only needs to listen on TCP/9997.
+
+Verify on Ubuntu:
+
+sudo ss -tulpn | grep 9997
+
+Expected:
+
+LISTEN ... :9997
+
+If UFW is enabled:
+
+sudo ufw allow 9997/tcp
+
+------------------------------------------------------------
+12. Avoid Incorrect Self-Forwarding Configuration
+------------------------------------------------------------
+
+A common mistake is adding this under Splunk Enterprise's own "Configure forwarding":
+
+192.168.56.122:9997
+
+This tells Splunk Enterprise to forward data to itself and is not needed in this lab.
+
+Correct configuration:
+
+Splunk Enterprise:
+- Configure forwarding: empty/not needed
+- Configure receiving: 9997
+
+Windows Universal Forwarder:
+- Destination: 192.168.56.122:9997
+
+------------------------------------------------------------
+13. Create a Dedicated Windows Index
+------------------------------------------------------------
+
+In Splunk Web:
+
+Settings
+-> Indexes
+-> New Index
+
+Recommended settings:
+
+Name:
+windows
+
+Index data type:
+Events
+
+Home path:
+Leave blank
+
+Cold path:
+Leave blank
+
+Thawed path:
+Leave blank
+
+Data integrity check:
+Disable for this simple lab
+
+Max size of entire index:
+10 GB is reasonable for a small home lab
+
+Max size of hot/warm/cold bucket:
+auto
+
+Frozen path:
+Leave blank
+
+App:
+Search & Reporting
+
+Tsidx retention policy:
+Disable reduction
+
+Explanation:
+
+Name:
+Logical name used in SPL queries.
+
+Events:
+Correct type for Windows Event Logs.
+
+Home path:
+Storage for hot/warm data. Default is sufficient for this lab.
+
+Cold path:
+Storage for older buckets. Default is sufficient.
+
+Thawed path:
+Used when restoring archived/frozen data.
+
+Data integrity:
+Can create hashes for data-integrity validation. Not necessary for this basic lab.
+
+Max size:
+Limits total index size so the lab does not consume unnecessary disk space.
+
+Bucket size:
+Let Splunk manage bucket sizing automatically.
+
+Frozen path:
+Used for archived buckets if configured.
+
+Tsidx reduction:
+Reduces index metadata to save space, but can affect search capabilities. Keep disabled for a basic lab.
+
+------------------------------------------------------------
+14. Install Splunk Universal Forwarder on Windows
+------------------------------------------------------------
+
+Download Splunk Universal Forwarder for Windows from the official Splunk website.
+
+Run the installer.
+
+Select:
+
+An on-premises Splunk Enterprise instance
+
+During installation, the installer asks for Universal Forwarder credentials.
+
+These credentials do NOT need to match:
+- Ubuntu credentials
+- Splunk Enterprise Web credentials
+
+They are local credentials for the Forwarder installation.
+
+Use a separate strong password.
+
+Do not expose credentials in documentation or GitHub.
+
+------------------------------------------------------------
+15. Configure the Forwarder Destination
+------------------------------------------------------------
+
+During the Universal Forwarder installer:
+
+Deployment Server:
+- Not required for this lab
+- Skip/leave empty
+
+Receiving Indexer:
+Host:
+<UBUNTU_HOST_ONLY_IP>
+
+Port:
+9997
+
+Example:
+
+Host:
+192.168.56.122
+
+Port:
+9997
+
+Meaning:
+
+Windows
+-> Universal Forwarder
+-> 192.168.56.122:9997
+-> Splunk Enterprise
+
+------------------------------------------------------------
+16. Universal Forwarder Does Not Create a Desktop App
+------------------------------------------------------------
+
+This is normal.
+
+Splunk Universal Forwarder usually runs as a Windows service and does not need a desktop GUI.
+
+Open PowerShell as Administrator.
+
+Check:
+
+Get-Service SplunkForwarder
+
+Expected:
+
+Status: Running
+
+If stopped:
+
+Start-Service SplunkForwarder
+
+Important:
+PowerShell must be launched with "Run as administrator" to start, stop, or restart the service.
+
+If this error appears:
+
+Cannot open SplunkForwarder service on computer '.'
+
+the terminal is most likely not elevated.
+
+------------------------------------------------------------
+17. Configure Which Windows Logs Are Collected
+------------------------------------------------------------
+
+Configuration file:
+
+C:\Program Files\SplunkUniversalForwarder\etc\system\local\inputs.conf
+
+For a personal Windows machine, start conservatively.
+
+Example: collect only Windows System logs:
+
+[WinEventLog://System]
+disabled = 0
+index = windows
+
+Why start with System only?
+
+Security logs can contain:
+- Usernames
+- Logon/logoff activity
+- Authentication failures
+- Workstation information
+- Source addresses
+- Other security-related metadata
+
+For a home lab on a personal machine, System logs are enough to validate the ingestion pipeline with less sensitive information.
+
+Later, Security logs can be enabled temporarily for SOC exercises.
+
+------------------------------------------------------------
+18. Restart the Forwarder
+------------------------------------------------------------
+
+Open PowerShell as Administrator:
+
+Restart-Service SplunkForwarder
+
+Check:
+
+Get-Service SplunkForwarder
+
+Expected:
+
+Running
+
+------------------------------------------------------------
+19. Test Connectivity from Windows to Splunk
+------------------------------------------------------------
+
+Run:
+
+Test-NetConnection <UBUNTU_HOST_ONLY_IP> -Port 9997
+
+Example:
+
+Test-NetConnection 192.168.56.122 -Port 9997
+
+Expected:
+
+PingSucceeded    : True
+TcpTestSucceeded : True
+
+Interpretation:
+
+PingSucceeded = True
+- Network path exists.
+
+TcpTestSucceeded = True
+- Splunk is listening and reachable on 9997.
+
+If Ping succeeds but TCP fails:
+- Splunk receiving port may not be configured.
+- Port 9997 may not be listening.
+- UFW/firewall may block the port.
+- Wrong IP may have been configured.
+
+On Ubuntu check:
+
+sudo ss -tulpn | grep 9997
+
+Also check:
+
+sudo ufw status
+
+------------------------------------------------------------
+20. Verify Data in Splunk
+------------------------------------------------------------
+
+Open:
+
+Search & Reporting
+
+For initial testing set the time range to:
+
+All time
+
+Search:
+
+index=windows
+
+If System logs are enabled:
+
+index=windows sourcetype="WinEventLog:System"
+
+Inspect fields such as:
+
+host
+source
+sourcetype
+EventCode
+_time
+
+Concepts:
+
+event:
+One recorded occurrence.
+
+host:
+The system associated with the event.
+
+source:
+Where the data was read from.
+
+sourcetype:
+How Splunk classifies/parses the data.
+
+index:
+Logical storage/search location.
+
+------------------------------------------------------------
+21. Optional: Add Windows Security Logs Later
+------------------------------------------------------------
+
+Only enable this if needed for a security exercise.
+
+Add to inputs.conf:
+
+[WinEventLog://Security]
+disabled = 0
+index = windows
+
+Then restart:
+
+Restart-Service SplunkForwarder
+
+Example SPL:
+
+index=windows sourcetype="WinEventLog:Security"
+
+Failed logon example:
+
+index=windows EventCode=4625
+
+A single 4625 event does not automatically mean brute force.
+It is evidence of a failed Windows logon and must be interpreted in context.
+
+------------------------------------------------------------
+22. Useful Troubleshooting Checklist
+------------------------------------------------------------
+
+A. MobaXterm cannot connect to Ubuntu
+
+Check:
+
+sudo systemctl status ssh
+ip a
+
+From Windows:
+
+ping <UBUNTU_HOST_ONLY_IP>
+
+Ensure:
+- Host-only adapter exists.
+- enp0s8 is UP.
+- Port 22 is allowed if UFW is active.
+
+------------------------------------------------------------
+
+B. enp0s8 is DOWN
+
+Run:
+
+sudo ip link set enp0s8 up
+
+Then:
+
+ip a
+
+If no IP:
+
+sudo dhclient enp0s8
+
+------------------------------------------------------------
+
+C. dhclient is missing
+
+Run:
+
+sudo apt update
+sudo apt install isc-dhcp-client -y
+
+------------------------------------------------------------
+
+D. Splunk does not start
+
+Check:
+
+sudo -u splunk /opt/splunk/bin/splunk status
+
+Start:
+
+sudo -u splunk /opt/splunk/bin/splunk start
+
+------------------------------------------------------------
+
+E. Splunk Web does not open
+
+Check:
+
+sudo ss -tulpn | grep 8000
+
+Test:
+
+http://<UBUNTU_HOST_ONLY_IP>:8000
+
+------------------------------------------------------------
+
+F. Windows can ping Ubuntu but port 9997 fails
+
+Windows:
+
+Test-NetConnection <UBUNTU_HOST_ONLY_IP> -Port 9997
+
+Ubuntu:
+
+sudo ss -tulpn | grep 9997
+
+If nothing is listening:
+- Open Splunk Web.
+- Settings
+- Forwarding and receiving
+- Configure receiving
+- New Receiving Port
+- 9997
+
+------------------------------------------------------------
+
+G. SplunkForwarder cannot be restarted
+
+Error example:
+
+Cannot open SplunkForwarder service on computer '.'
+
+Fix:
+Run PowerShell as Administrator.
+
+Then:
+
+Restart-Service SplunkForwarder
+
+------------------------------------------------------------
+
+H. No data appears in index=windows
+
+Check in this order:
+
+1. Splunk Enterprise is running.
+2. Receiver 9997 exists.
+3. Port 9997 is reachable.
+4. SplunkForwarder service is running.
+5. inputs.conf exists and has the correct stanza.
+6. index=windows exists.
+7. Time range in Splunk Search is wide enough.
+8. Restart the Forwarder after configuration changes.
+
+Useful commands:
+
+Windows:
+
+Get-Service SplunkForwarder
+
+Test-NetConnection <UBUNTU_HOST_ONLY_IP> -Port 9997
+
+Ubuntu:
+
+sudo ss -tulpn | grep 9997
+
+Splunk:
+
+index=windows
+
+------------------------------------------------------------
+23. Disk Usage Monitoring
+------------------------------------------------------------
+
+Splunk data can grow over time.
+
+Check indexed-data usage on Ubuntu:
+
+du -sh /opt/splunk/var/lib/splunk
+
+Use a reasonable index size limit in a home lab and ingest only the log channels required for the exercise.
+
+------------------------------------------------------------
+24. Security and Privacy Notes
+------------------------------------------------------------
+
+Do not commit any of the following to a public GitHub repository:
+
+- Splunk passwords
+- Ubuntu passwords
+- Forwarder credentials
+- API tokens
+- Private keys
+- Sensitive Windows event screenshots
+- Personal usernames if they should remain private
+- Publicly reachable IP addresses
+
+Before uploading screenshots:
+- Review visible usernames.
+- Review hostnames.
+- Review IP addresses.
+- Review event contents.
+- Redact anything unnecessary.
+
+For a personal Windows endpoint, start with:
+
+Windows System Event Log
+
+and only add Security/PowerShell/Sysmon when needed for a specific lab.
+
+------------------------------------------------------------
+25. Final Validation
+------------------------------------------------------------
+
+The deployment is working correctly when all of the following are true:
+
+[ ] Ubuntu can access the Internet through NAT.
+[ ] Ubuntu has a Host-only IP.
+[ ] SSH works from MobaXterm.
+[ ] Splunk Enterprise is running.
+[ ] Splunk Web opens on port 8000.
+[ ] Index "windows" exists.
+[ ] Splunk Enterprise is listening on TCP/9997.
+[ ] Splunk Universal Forwarder is installed on Windows.
+[ ] SplunkForwarder service is running.
+[ ] Windows can connect to Ubuntu on TCP/9997.
+[ ] inputs.conf enables the desired Windows Event Log channel.
+[ ] index=windows returns real Windows events.
+[ ] The event's host/source/sourcetype/EventCode/_time can be inspected.
+
+------------------------------------------------------------
+26. Final Data Flow
+------------------------------------------------------------
+
+Windows Event Log
+        |
+        | collected by
+        v
+Splunk Universal Forwarder
+        |
+        | sends over TCP/9997
+        v
+Splunk Enterprise
+        |
+        | stores in
+        v
+index=windows
+        |
+        | queried with SPL
+        v
+Search & Reporting
+
+Key lesson:
+
+Splunk does not create the Windows event.
+
+Windows creates the event.
+Universal Forwarder collects and sends it.
+Splunk Enterprise receives and indexes it.
+The analyst searches and investigates it.
+
+End of Guide

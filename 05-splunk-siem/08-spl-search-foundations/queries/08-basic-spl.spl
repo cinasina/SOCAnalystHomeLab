@@ -1,0 +1,15 @@
+index=windows
+
+index=windows sourcetype="WinEventLog:System"
+
+index=windows sourcetype="WinEventLog:System"
+| stats count by EventCode
+| sort - count
+
+index=windows sourcetype="WinEventLog:System"
+| top limit=10 EventCode
+
+index=windows sourcetype="WinEventLog:System"
+| table _time host EventCode SourceName Message
+| sort - _time
+| head 20
